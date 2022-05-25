@@ -127,6 +127,17 @@ namespace uPLibrary.Networking.M2Mqtt.Exceptions
         /// <summary>
         /// Invalid protocol name
         /// </summary>
-        InvalidProtocolName
+        InvalidProtocolName,
+
+		/// <summary>
+		/// Timeout waiting for published message
+		/// </summary>
+		WaitForPublishedTimeout,
+
+		/// <summary>
+		/// Messaege was not published
+		/// </summary>
+		PublishFailed
+
     }
 }

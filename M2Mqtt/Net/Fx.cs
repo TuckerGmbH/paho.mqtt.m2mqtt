@@ -23,9 +23,18 @@ namespace uPLibrary.Networking.M2Mqtt
     /// </summary>
     public class Fx
     {
-        public static void StartThread(ThreadStart threadStart)
+
+		public static ThreadPriority Priority = ThreadPriority.BelowNormal;
+
+        public static void StartThread(ThreadStart threadStart, string name)
         {
-            new Thread(threadStart).Start();
+
+			var thread = new Thread(threadStart);
+			thread.Name = name;
+			thread.Priority = Priority;
+
+			thread.Start();
+
         }
 
         public static void SleepThread(int millisecondsTimeout)

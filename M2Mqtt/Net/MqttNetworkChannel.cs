@@ -18,14 +18,20 @@ Contributors:
 #if (MF_FRAMEWORK_VERSION_V4_2 || MF_FRAMEWORK_VERSION_V4_3)
 using Microsoft.SPOT.Net.Security;
 #else
+#if  COMPACT_FRAMEWORK
+
+#else
 using System.Net.Security;
 using System.Security.Authentication;
+#endif
 #endif
 #endif
 using System.Net.Sockets;
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
 using System;
+using System.Threading;
+
 
 namespace uPLibrary.Networking.M2Mqtt
 {
@@ -38,6 +44,13 @@ namespace uPLibrary.Networking.M2Mqtt
         private readonly RemoteCertificateValidationCallback userCertificateValidationCallback;
         private readonly LocalCertificateSelectionCallback userCertificateSelectionCallback;
 #endif
+
+        // Connect handles
+        private bool connectSuccessful = false;
+		private readonly object connectLock = new object();
+		private Exception connectException;
+        private ManualResetEvent connectWait = new ManualResetEvent(false);
+
         // remote host information
         private string remoteHostName;
         private IPAddress remoteIpAddress;
@@ -109,76 +122,13 @@ namespace uPLibrary.Networking.M2Mqtt
         /// <summary>
         /// Constructor
         /// </summary>
-        /// <param name="socket">Socket opened with the client</param>
-        public MqttNetworkChannel(Socket socket)
-#if !(MF_FRAMEWORK_VERSION_V4_2 || MF_FRAMEWORK_VERSION_V4_3 || COMPACT_FRAMEWORK)
-            : this(socket, false, null, MqttSslProtocols.None, null, null)
-#else
-            : this(socket, false, null, MqttSslProtocols.None)
-#endif
-        {
-
-        }
-        
-        /// <summary>
-        /// Constructor
-        /// </summary>
-        /// <param name="socket">Socket opened with the client</param>
-        /// <param name="secure">Secure connection (SSL/TLS)</param>
-        /// <param name="serverCert">Server X509 certificate for secure connection</param>
-        /// <param name="sslProtocol">SSL/TLS protocol version</param>
-#if !(MF_FRAMEWORK_VERSION_V4_2 || MF_FRAMEWORK_VERSION_V4_3 || COMPACT_FRAMEWORK)
-        /// <param name="userCertificateSelectionCallback">A RemoteCertificateValidationCallback delegate responsible for validating the certificate supplied by the remote party</param>
-        /// <param name="userCertificateValidationCallback">A LocalCertificateSelectionCallback delegate responsible for selecting the certificate used for authentication</param>
-        public MqttNetworkChannel(Socket socket, bool secure, X509Certificate serverCert, MqttSslProtocols sslProtocol,
-            RemoteCertificateValidationCallback userCertificateValidationCallback,
-            LocalCertificateSelectionCallback userCertificateSelectionCallback)
-#else
-        public MqttNetworkChannel(Socket socket, bool secure, X509Certificate serverCert, MqttSslProtocols sslProtocol)
-#endif
-        {
-            this.socket = socket;
-            this.secure = secure;
-            this.serverCert = serverCert;
-            this.sslProtocol = sslProtocol;
-#if !(MF_FRAMEWORK_VERSION_V4_2 || MF_FRAMEWORK_VERSION_V4_3 || COMPACT_FRAMEWORK)
-            this.userCertificateValidationCallback = userCertificateValidationCallback;
-            this.userCertificateSelectionCallback = userCertificateSelectionCallback;
-#endif
-        }
-
-        /// <summary>
-        /// Constructor
-        /// </summary>
-        /// <param name="remoteHostName">Remote Host name</param>
-        /// <param name="remotePort">Remote port</param>
-        public MqttNetworkChannel(string remoteHostName, int remotePort)
-#if !(MF_FRAMEWORK_VERSION_V4_2 || MF_FRAMEWORK_VERSION_V4_3 || COMPACT_FRAMEWORK)
-            : this(remoteHostName, remotePort, false, null, null, MqttSslProtocols.None, null, null)
-#else
-            : this(remoteHostName, remotePort, false, null, null, MqttSslProtocols.None)
-#endif
-        {
-        }
-
-        /// <summary>
-        /// Constructor
-        /// </summary>
         /// <param name="remoteHostName">Remote Host name</param>
         /// <param name="remotePort">Remote port</param>
         /// <param name="secure">Using SSL</param>
         /// <param name="caCert">CA certificate</param>
         /// <param name="clientCert">Client certificate</param>
         /// <param name="sslProtocol">SSL/TLS protocol version</param>
-#if !(MF_FRAMEWORK_VERSION_V4_2 || MF_FRAMEWORK_VERSION_V4_3 || COMPACT_FRAMEWORK)
-        /// <param name="userCertificateSelectionCallback">A RemoteCertificateValidationCallback delegate responsible for validating the certificate supplied by the remote party</param>
-        /// <param name="userCertificateValidationCallback">A LocalCertificateSelectionCallback delegate responsible for selecting the certificate used for authentication</param>
-        public MqttNetworkChannel(string remoteHostName, int remotePort, bool secure, X509Certificate caCert, X509Certificate clientCert, MqttSslProtocols sslProtocol,
-            RemoteCertificateValidationCallback userCertificateValidationCallback,
-            LocalCertificateSelectionCallback userCertificateSelectionCallback)
-#else
         public MqttNetworkChannel(string remoteHostName, int remotePort, bool secure, X509Certificate caCert, X509Certificate clientCert, MqttSslProtocols sslProtocol)
-#endif
         {
             IPAddress remoteIpAddress = null;
             try
@@ -191,9 +141,24 @@ namespace uPLibrary.Networking.M2Mqtt
             }
 
             // in this case the parameter remoteHostName isn't a valid IP address
+            /* Checked in Connect function to ensure that host name resolution is 
+             * correct for each connection attempt so checking here is no longer 
+             * needed and otherwise might prevent construction of the mqtt client 
+             * and delegator if the host name cant be resolved
+             * 
             if (remoteIpAddress == null)
             {
-                IPHostEntry hostEntry = Dns.GetHostEntry(remoteHostName);
+                IPHostEntry hostEntry = null;
+
+                try
+                {
+                    hostEntry = Dns.GetHostEntry(remoteHostName);
+                }
+                catch
+                {
+                    throw new Exception("No address found for the remote host name");
+                }
+
                 if ((hostEntry != null) && (hostEntry.AddressList.Length > 0))
                 {
                     // check for the first address not null
@@ -207,6 +172,7 @@ namespace uPLibrary.Networking.M2Mqtt
                     throw new Exception("No address found for the remote host name");
                 }
             }
+            */
 
             this.remoteHostName = remoteHostName;
             this.remoteIpAddress = remoteIpAddress;
@@ -226,16 +192,58 @@ namespace uPLibrary.Networking.M2Mqtt
         /// </summary>
         public void Connect()
         {
-            this.socket = new Socket(this.remoteIpAddress.GetAddressFamily(), SocketType.Stream, ProtocolType.Tcp);
-            // try connection to the broker
-            this.socket.Connect(new IPEndPoint(this.remoteIpAddress, this.remotePort));
+            this.remoteIpAddress = GetIPAddrFromHostName(this.remoteHostName);
 
+            if (this.remoteIpAddress != null)
+            {
+			
+            	connectWait.Reset();
+
+                lock (connectLock)
+                {
+
+                    if (socket != null)
+                    {
+                        System.Diagnostics.Debug.WriteLine("TLS: CLOSE SOCKET ON CONNECT 1");
+                        socket.Close();
+                    }
+
+                    connectException = null;
+
+                    this.socket = new Socket(this.remoteIpAddress.GetAddressFamily(), SocketType.Stream, ProtocolType.Tcp);
+                    this.socket.Blocking = true;
+                    // try connection to the broker
+                    this.socket.BeginConnect(new IPEndPoint(this.remoteIpAddress, this.remotePort), new AsyncCallback(CallBackMethod), this.socket);
+
+                }
+
+				if (connectWait.WaitOne(2000, false))
+	            {
+	                if (!connectSuccessful)
+	                {
+						if (connectException != null)
+							throw connectException;
+	                    else
+	                        throw new SocketException();
+	                }
+	            }
+	            else
+	            {
+	                //Prevent any exceptions from disconnecting after publish for porsche spec
+	                lock (connectLock)
+	                {
+                        System.Diagnostics.Debug.WriteLine("TLS: CLOSE SOCKET ON CONNECT 2");
+                        this.socket.Close();
+	                }
+	                throw new TimeoutException("TimeOut Exception");
+	            }
+            
 #if SSL
             // secure channel requested
             if (secure)
             {
                 // create SSL stream
-#if (MF_FRAMEWORK_VERSION_V4_2 || MF_FRAMEWORK_VERSION_V4_3)
+#if (MF_FRAMEWORK_VERSION_V4_2 || MF_FRAMEWORK_VERSION_V4_3 || COMPACT_FRAMEWORK)
                 this.sslStream = new SslStream(this.socket);
 #else
                 this.netStream = new NetworkStream(this.socket);
@@ -250,6 +258,9 @@ namespace uPLibrary.Networking.M2Mqtt
                     SslVerification.CertificateRequired,
                     MqttSslUtility.ToSslPlatformEnum(this.sslProtocol));
 #else
+#if (COMPACT_FRAMEWORK)
+
+#else
                 X509CertificateCollection clientCertificates = null;
                 // check if there is a client certificate to add to the collection, otherwise it's null (as empty)
                 if (this.clientCert != null)
@@ -259,10 +270,185 @@ namespace uPLibrary.Networking.M2Mqtt
                     clientCertificates,
                     MqttSslUtility.ToSslPlatformEnum(this.sslProtocol),
                     false);
-                
+   
+#endif             
 #endif
             }
 #endif
+            }
+            else
+            {
+                throw new Exception("No address found for the remote host name");
+            }
+
+        }
+
+        private void CallBackMethod(IAsyncResult asyncresult)
+        {
+            //Prevent any exceptions from disconnecting after publish for porsche spec
+            lock (connectLock)
+            {
+                try
+                {
+                    connectSuccessful = false;
+                    Socket socket = asyncresult.AsyncState as Socket;
+
+                    if (CheckConnection(socket, true, true))
+                    {
+                        socket.EndConnect(asyncresult);
+						connectSuccessful = true;
+                    }                
+                }
+                catch (Exception ex)
+                {
+                    connectSuccessful = false;
+                    connectException = ex;
+                }
+                finally
+                {
+                    connectWait.Set();
+                }
+            }                        
+        }
+
+        /// <summary>
+        /// Checks if the connection is active on the specified socket
+        /// </summary>
+        /// <param name="socket">The socket to check the connection</param>
+        /// <param name="checkForReading">Set true if check should be performed for reading or false for writing</param>
+        /// <param name="closeSocketOnDisconnected">Set true if socket should be close if connection is not established</param>
+        /// <returns><c>True</c> if the connection is active; otherwise <c>false</c></returns>
+        protected bool CheckConnection(Socket socket, bool checkForReading, bool closeSocketOnDisconnected)
+        {
+
+            try
+            {
+
+                if (socket == null)
+                {
+                    // Socket to assigned => connection is not active
+                    return false;
+                }
+                else if (socket.ProtocolType == ProtocolType.Tcp &&
+                         !socket.Connected)
+                {
+                    // Connection is closed => connection is not active
+                    if (closeSocketOnDisconnected)
+                    {
+                        CloseSocket(socket);
+                    }
+                    return false;
+                }
+                else if (checkForReading &&
+                         socket.Poll(0, SelectMode.SelectRead))
+                {
+
+                    // true if Listen has been called and a connection is pending; 
+                    // -or- 
+                    // true if data is available for reading; 
+                    // -or- 
+                    // true if the connection has been closed, reset, or terminated; 
+                    // otherwise, returns false.
+
+                    if (socket.Available > 0)
+                    {
+                        // Data is available => connection is active
+                        return true;
+                    }
+                    else if (socket.Poll(0, SelectMode.SelectError))
+                    {
+                        // We have a error... => connection might be not active
+                        if (closeSocketOnDisconnected)
+                        {
+                            CloseSocket(socket);
+                        }
+                        return false;
+                    }
+                    else
+                    {
+                        // We have no error and no data but the connection should be active
+                        return true;
+                    }
+
+                }
+                else if (!checkForReading &&
+                         socket.Poll(0, SelectMode.SelectWrite))
+                {
+
+                    // true, if processing a Connect, and the connection has succeeded; 
+                    // -or- 
+                    // true if data can be sent; 
+                    // otherwise, returns false. 
+
+                    if (socket.Poll(0, SelectMode.SelectError))
+                    {
+                        // We have a error... => connection might be not active
+                        if (closeSocketOnDisconnected)
+                        {
+                            CloseSocket(socket);
+                        }
+                        return false;
+                    }
+                    else
+                    {
+                        // We have no error so the connection should be active
+                        return true;
+                    }
+
+                }              
+                else if (socket.Poll(0, SelectMode.SelectError))
+                {
+                    // We have a error... => connection might be not active
+                    if (closeSocketOnDisconnected)
+                    {
+                        CloseSocket(socket);
+                    }
+                    return false;
+                }               
+                else
+                {
+                    // Socket not readable => we e.g. receive data => connection is active
+                    return true;
+                }
+
+            }
+            catch (Exception)
+            {
+                // Error occured => Connection problem (might occure if adapter is disposed => ok in that case)
+                if (closeSocketOnDisconnected)
+                {
+                    CloseSocket(socket);
+                }
+                return false;
+            }
+
+        }
+
+        /// <summary>
+        /// Closes the passed socket gracefully
+        /// </summary>
+        /// <param name="socket">The socket to close</param>
+        protected virtual void CloseSocket(Socket socket)
+        {
+
+            //try
+            //{
+            if (socket != null)
+            {
+                if (socket.Connected)
+                {
+                    socket.Shutdown(SocketShutdown.Both);
+                }
+                socket.Close();
+                //EventLogger.LogEventSmart(EventLogger.DebugLevels.COMMUNICATION_ADAPTER, this, () => "{0}: Communication socket closed ({1})", name, endPointInfo);
+            }
+            /*}
+            catch (Exception e)
+            {
+                // Should never happen...
+                //EventLogger.LogEventSmart(EventLogger.DebugLevels.COMMUNICATION_ADAPTER_WARNINGS, this, () => "{0}: Error during closing socket: {1}", name, e.Message);
+            }*/
+
         }
 
         /// <summary>
@@ -284,6 +470,54 @@ namespace uPLibrary.Networking.M2Mqtt
 #else
             return this.socket.Send(buffer, 0, buffer.Length, SocketFlags.None);
 #endif
+        }
+
+        /// <summary>
+        /// Gets an IP Address from a remote hostname string
+        /// </summary>
+        /// <param name="hostName">Hostname to get an IP Address for</param>
+        /// <returns>The IP Address of the remote hostname</returns>
+        private IPAddress GetIPAddrFromHostName(string hostName)
+        {
+            IPAddress tempIP = null;
+            IPHostEntry hostEntry = null;
+            try
+            {
+                // check if remoteHostName is a valid IP address and get it
+                tempIP = IPAddress.Parse(hostName);
+            }
+            catch
+            {               
+            }
+
+            // in this case the parameter remoteHostName isn't a valid IP address
+            if (tempIP == null)
+            {
+                try
+                {
+
+                    hostEntry = Dns.GetHostEntry(hostName);
+                }
+                catch
+                {
+                    throw new Exception("No address found for the remote host name");
+                }
+
+                if ((hostEntry != null) && (hostEntry.AddressList.Length > 0))
+                {
+                    // check for the first address not null
+                    // it seems that with .Net Micro Framework, the IPV6 addresses aren't supported and return "null"
+                    int i = 0;
+                    while (hostEntry.AddressList[i] == null) i++;
+                    tempIP = hostEntry.AddressList[i];
+                }
+                else
+                {
+                    throw new Exception("No address found for the remote host name");
+                }
+            }
+
+            return tempIP;
         }
 
         /// <summary>
@@ -364,6 +598,8 @@ namespace uPLibrary.Networking.M2Mqtt
         /// </summary>
         public void Close()
         {
+            lock (connectLock)
+            {
 #if SSL
             if (this.secure)
             {
@@ -374,8 +610,11 @@ namespace uPLibrary.Networking.M2Mqtt
             }
             this.socket.Close();
 #else
-            this.socket.Close();
+                System.Diagnostics.Debug.WriteLine("TLS: CLOSE SOCKET EXTERNAL");
+
+                this.socket.Close();
 #endif
+            }
         }
 
         /// <summary>
@@ -387,7 +626,8 @@ namespace uPLibrary.Networking.M2Mqtt
             // secure channel requested
             if (secure)
             {
-#if !(MF_FRAMEWORK_VERSION_V4_2 || MF_FRAMEWORK_VERSION_V4_3)
+
+#if !(MF_FRAMEWORK_VERSION_V4_2 || MF_FRAMEWORK_VERSION_V4_3 || COMPACT_FRAMEWORK)
 
                 this.netStream = new NetworkStream(this.socket);
                 this.sslStream = new SslStream(this.netStream, false, this.userCertificateValidationCallback, this.userCertificateSelectionCallback);
@@ -440,10 +680,10 @@ namespace uPLibrary.Networking.M2Mqtt
                     return SslProtocols.Ssl3;
                 case MqttSslProtocols.TLSv1_0:
                     return SslProtocols.Tls;
-                case MqttSslProtocols.TLSv1_1:
-                    return SslProtocols.Tls11;
-                case MqttSslProtocols.TLSv1_2:
-                    return SslProtocols.Tls12;
+                //case MqttSslProtocols.TLSv1_1:
+                //    return SslProtocols.Tls11;
+                //case MqttSslProtocols.TLSv1_2:
+                //    return SslProtocols.Tls12;
                 default:
                     throw new ArgumentException("SSL/TLS protocol version not supported");
             }
@@ -465,6 +705,23 @@ namespace uPLibrary.Networking.M2Mqtt
                     throw new ArgumentException("SSL/TLS protocol version not supported");
             }
         }
+#elif (FRAMEWORK_V4)
+		public static SslProtocols ToSslPlatformEnum(MqttSslProtocols mqttSslProtocol)
+		{
+			switch (mqttSslProtocol)
+			{
+				case MqttSslProtocols.None:
+					return SslProtocols.None;
+				case MqttSslProtocols.SSLv3:
+					return SslProtocols.Ssl3;
+				case MqttSslProtocols.TLSv1_0:
+					return SslProtocols.Tls;
+				case MqttSslProtocols.TLSv1_1:
+				case MqttSslProtocols.TLSv1_2:
+				default:
+					throw new ArgumentException("SSL/TLS protocol version not supported");
+			}
+		}
 #endif
-    }
+	}
 }
