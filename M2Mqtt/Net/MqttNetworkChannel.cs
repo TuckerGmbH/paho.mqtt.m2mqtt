@@ -32,6 +32,9 @@ using System.Security.Cryptography.X509Certificates;
 using System;
 using System.Threading;
 
+// alias needed due to Microsoft.SPOT.Trace in .Net Micro Framework
+// (it's ambiguos with uPLibrary.Networking.M2Mqtt.Utility.Trace)
+using MqttUtility = uPLibrary.Networking.M2Mqtt.Utility;
 
 namespace uPLibrary.Networking.M2Mqtt
 {
@@ -44,6 +47,21 @@ namespace uPLibrary.Networking.M2Mqtt
         private readonly RemoteCertificateValidationCallback userCertificateValidationCallback;
         private readonly LocalCertificateSelectionCallback userCertificateSelectionCallback;
 #endif
+
+        /// <summary>
+        /// The maximum time to wait for a tcp connect
+        /// </summary>
+        private const int CONNECT_TIMEOUT = 2000;
+
+        /// <summary>
+        /// The maximum time to wait for a tcp send
+        /// </summary>
+        private const int SEND_TIMEOUT = 5000;
+
+        /// <summary>
+        /// The maximum time to wait for a tcp send
+        /// </summary>
+        private const int SEND_TIMEOUTS_IN_SEQUENCE_MAXIMUM = 3;
 
         // Connect handles
         private bool connectSuccessful = false;
@@ -60,6 +78,11 @@ namespace uPLibrary.Networking.M2Mqtt
         private Socket socket;
         // using SSL
         private bool secure;
+
+        /// <summary>
+        /// Counter for send timeouts in sequence
+        /// </summary>
+        private ushort sendTimeoutsInSequence;
 
         // CA certificate (on client)
         private X509Certificate caCert;
@@ -204,11 +227,11 @@ namespace uPLibrary.Networking.M2Mqtt
 
                     if (socket != null)
                     {
-                        System.Diagnostics.Debug.WriteLine("TLS: CLOSE SOCKET ON CONNECT 1");
                         socket.Close();
                     }
 
                     connectException = null;
+                    sendTimeoutsInSequence = 0;
 
                     this.socket = new Socket(this.remoteIpAddress.GetAddressFamily(), SocketType.Stream, ProtocolType.Tcp);
                     this.socket.Blocking = true;
@@ -217,7 +240,7 @@ namespace uPLibrary.Networking.M2Mqtt
 
                 }
 
-				if (connectWait.WaitOne(2000, false))
+				if (connectWait.WaitOne(CONNECT_TIMEOUT, false))
 	            {
 	                if (!connectSuccessful)
 	                {
@@ -232,7 +255,6 @@ namespace uPLibrary.Networking.M2Mqtt
 	                //Prevent any exceptions from disconnecting after publish for porsche spec
 	                lock (connectLock)
 	                {
-                        System.Diagnostics.Debug.WriteLine("TLS: CLOSE SOCKET ON CONNECT 2");
                         this.socket.Close();
 	                }
 	                throw new TimeoutException("TimeOut Exception");
@@ -440,16 +462,14 @@ namespace uPLibrary.Networking.M2Mqtt
                     socket.Shutdown(SocketShutdown.Both);
                 }
                 socket.Close();
-                //EventLogger.LogEventSmart(EventLogger.DebugLevels.COMMUNICATION_ADAPTER, this, () => "{0}: Communication socket closed ({1})", name, endPointInfo);
             }
             /*}
             catch (Exception e)
             {
                 // Should never happen...
-                //EventLogger.LogEventSmart(EventLogger.DebugLevels.COMMUNICATION_ADAPTER_WARNINGS, this, () => "{0}: Error during closing socket: {1}", name, e.Message);
             }*/
 
-        }
+        }        
 
         /// <summary>
         /// Send data on the network channel
@@ -466,9 +486,33 @@ namespace uPLibrary.Networking.M2Mqtt
                 return buffer.Length;
             }
             else
+            {
                 return this.socket.Send(buffer, 0, buffer.Length, SocketFlags.None);
-#else
-            return this.socket.Send(buffer, 0, buffer.Length, SocketFlags.None);
+            }
+#else            
+
+            var ar = this.socket.BeginSend(buffer, 0, buffer.Length, SocketFlags.None, null, null);
+
+            if (ar.AsyncWaitHandle.WaitOne(SEND_TIMEOUT, false))
+            {
+                sendTimeoutsInSequence = 0;
+                return this.socket.EndSend(ar);
+            }
+            else
+            {                
+#if TRACE
+                MqttUtility.Trace.WriteLine(MqttUtility.TraceLevel.Error, "MqttNetworkChannel: Send Timeout - in sequence {0}", sendTimeoutsInSequence);
+#endif
+                sendTimeoutsInSequence++;
+                if(sendTimeoutsInSequence >= SEND_TIMEOUTS_IN_SEQUENCE_MAXIMUM)
+                {
+                    CloseSocket(this.socket);                    
+#if TRACE
+                    MqttUtility.Trace.WriteLine(MqttUtility.TraceLevel.Error, "MqttNetworkChannel: Send Timeout - socket closed");
+#endif
+                }
+                return 0;
+            }
 #endif
         }
 
@@ -610,8 +654,6 @@ namespace uPLibrary.Networking.M2Mqtt
             }
             this.socket.Close();
 #else
-                System.Diagnostics.Debug.WriteLine("TLS: CLOSE SOCKET EXTERNAL");
-
                 this.socket.Close();
 #endif
             }
